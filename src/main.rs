@@ -75,7 +75,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 // Tunables
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SPEED: f64 = 1.5;
+const SPEED: f64 = 1.25;
 
 /// The artificial cursor is rendered at this fraction of the PNG's natural size.
 const CURSOR_DISPLAY_SCALE: f64 = 0.775;
