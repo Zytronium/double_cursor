@@ -78,7 +78,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 const SPEED: f64 = 1.5;
 
 /// The artificial cursor is rendered at this fraction of the PNG's natural size.
-const CURSOR_DISPLAY_SCALE: f64 = 0.95;
+const CURSOR_DISPLAY_SCALE: f64 = 0.8;
 
 // Linux key codes for left/right mouse buttons
 const BTN_LEFT:  u16 = 0x110;
