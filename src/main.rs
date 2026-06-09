@@ -78,7 +78,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 const SPEED: f64 = 1.5;
 
 /// The artificial cursor is rendered at this fraction of the PNG's natural size.
-const CURSOR_DISPLAY_SCALE: f64 = 0.8;
+const CURSOR_DISPLAY_SCALE: f64 = 0.775;
 
 // Linux key codes for left/right mouse buttons
 const BTN_LEFT:  u16 = 0x110;
@@ -500,8 +500,22 @@ impl AppState {
         if !c.configured { return; }
         c.x = (c.x + dx as i32).clamp(0, self.screen_w - 1);
         c.y = (c.y + dy as i32).clamp(0, self.screen_h - 1);
-        c.layer_surface.set_margin(c.y, 0, 0, c.x);
+        let (cx, cy) = (c.x, c.y);
+        c.layer_surface.set_margin(cy, 0, 0, cx);
         c.surface.commit();
+
+        // While a button is held (drag in progress), keep the real cursor
+        // tracking the artificial one so the drag target sees movement.
+        if self.saved_real_pos.is_some() {
+            if let Some(vdev) = &mut self.abs_vdev {
+                let events = [
+                    InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, cx),
+                    InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_Y.0, cy),
+                    InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
+                ];
+                let _ = vdev.emit(&events);
+            }
+        }
     }
 
     fn commit_cursor(&mut self, idx: usize) {
