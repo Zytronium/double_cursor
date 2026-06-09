@@ -1,0 +1,13 @@
+[package]
+name = "double_cursor"
+version = "0.1.0"
+edition = "2021"
+description = "Dual artificial cursors driven by two mice – native Wayland + evdev"
+
+[dependencies]
+evdev = "0.13"
+wayland-client  = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+tempfile = "=3.10.1"
+png = "0.17"
