@@ -47,9 +47,7 @@ use std::{
     io::Write,
     os::unix::io::AsFd,
     path::PathBuf,
-    sync::{Arc, Mutex},
     thread,
-    time::Duration,
 };
 
 use evdev::{
@@ -82,15 +80,16 @@ const SPEED: f64 = 1.25;
 /// The artificial cursor is rendered at this fraction of the PNG's natural size.
 const CURSOR_DISPLAY_SCALE: f64 = 0.75;
 
-// Linux key codes for left/right mouse buttons
-const BTN_LEFT:  u16 = 0x110;
-const BTN_RIGHT: u16 = 0x111;
+// Touch state codes — used to derive relative motion from touchpads
+const BTN_TOUCH:       u16 = 0x14a;
+const BTN_TOOL_FINGER: u16 = 0x145;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cursor images — embedded at compile time from assets/
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CURSOR_WHITE_PNG: &[u8] = include_bytes!("../assets/cur_white.png");
+const CURSOR_BLACK_PNG: &[u8] = include_bytes!("../assets/cur_black.png");
 
 /// Decode a PNG (RGB or RGBA, 8-bit) into raw ARGB8888 bytes as expected by
 /// wl_shm (little-endian 0xAARRGGBB → [B, G, R, A] in memory).
@@ -209,22 +208,32 @@ fn connect_wayland() -> Connection {
 // Mouse discovery (evdev)
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn discover_mice(limit: usize) -> Vec<PathBuf> {
+fn discover_pointers(limit: usize) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for i in 0..=99u32 {
         if found.len() >= limit { break; }
         let p = PathBuf::from(format!("/dev/input/event{i}"));
         if !p.exists() { continue; }
         if let Ok(dev) = Device::open(&p) {
-            let has_rel_xy = dev.supported_relative_axes().map_or(false, |a| {
-                a.contains(RelativeAxisCode::REL_X) && a.contains(RelativeAxisCode::REL_Y)
-            });
             // Keyboards also expose REL_X/REL_Y for scroll wheels, but they
             // have letter keys — use KEY_A as a reliable keyboard marker.
             let is_keyboard = dev.supported_keys().map_or(false, |k| {
                 k.contains(evdev::KeyCode::KEY_A)
             });
-            if has_rel_xy && !is_keyboard {
+            if is_keyboard { continue; }
+
+            let has_rel_xy = dev.supported_relative_axes().map_or(false, |a| {
+                a.contains(RelativeAxisCode::REL_X) && a.contains(RelativeAxisCode::REL_Y)
+            });
+            let has_abs_xy = dev.supported_absolute_axes().map_or(false, |a| {
+                a.contains(AbsoluteAxisCode::ABS_X) && a.contains(AbsoluteAxisCode::ABS_Y)
+            });
+            let has_touch = dev.supported_keys().map_or(false, |k| {
+                k.contains(evdev::KeyCode::BTN_TOOL_FINGER) || k.contains(evdev::KeyCode::BTN_TOUCH)
+            });
+
+            // Mice report REL_X/REL_Y; trackpads report ABS_X/ABS_Y + a touch key.
+            if has_rel_xy || (has_abs_xy && has_touch) {
                 println!(
                     "[discovery] {} – {}",
                     p.display(),
@@ -235,125 +244,6 @@ fn discover_mice(limit: usize) -> Vec<PathBuf> {
         }
     }
     found
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Interactive calibration — wait for the first two mice to produce input,
-// assign roles in the order they are detected.
-// ─────────────────────────────────────────────────────────────────────────────
-
-/// Open every discovered mouse device in a short-lived race: whichever two
-/// devices first emit a REL_X or REL_Y movement event become mouse-0 (real
-/// cursor) and mouse-1 (artificial cursor) respectively.
-///
-/// Returns `[primary_path, secondary_path]` or `None` if fewer than two
-/// devices responded within the timeout.
-fn calibrate_mice(candidates: &[PathBuf], timeout: Duration) -> Option<[PathBuf; 2]> {
-    println!();
-    println!("─────────────────────────────────────────────────────────");
-    println!(" CALIBRATION — move the mouse you want as the REAL cursor");
-    println!(" first, then move the mouse you want as the ARTIFICIAL");
-    println!(" cursor.  (Timeout: {}s)", timeout.as_secs());
-    println!("─────────────────────────────────────────────────────────");
-    println!();
-
-    // Shared ordered list of device paths that have moved, protected by a Mutex.
-    let winners: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
-    // Channel so threads can wake the main thread as soon as 2 devices moved.
-    let (wake_tx, wake_rx) = std::sync::mpsc::channel::<()>();
-
-    let mut handles = Vec::new();
-
-    for path in candidates {
-        let path   = path.clone();
-        let winners = Arc::clone(&winners);
-        let wake_tx = wake_tx.clone();
-
-        let handle = thread::Builder::new()
-            .name(format!("calib-{}", path.display()))
-            .spawn(move || {
-                let mut dev = match Device::open(&path) {
-                    Ok(d)  => d,
-                    Err(e) => { eprintln!("[calib] cannot open {}: {e}", path.display()); return; }
-                };
-                // Non-blocking grab — if it fails we still detect movement.
-                let _ = dev.grab();
-
-                loop {
-                    // Check if calibration is already complete.
-                    {
-                        let w = winners.lock().unwrap();
-                        if w.len() >= 2 { return; }
-                    }
-
-                    let evs = match dev.fetch_events() {
-                        Ok(e)  => e,
-                        Err(_) => return,
-                    };
-
-                    let mut moved = false;
-                    for ev in evs {
-                        match ev.destructure() {
-                            EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, v) if v != 0 => { moved = true; }
-                            EventSummary::RelativeAxis(_, RelativeAxisCode::REL_Y, v) if v != 0 => { moved = true; }
-                            _ => {}
-                        }
-                    }
-
-                    if moved {
-                        let mut w = winners.lock().unwrap();
-                        // Only record this device if it hasn't been seen yet.
-                        if !w.contains(&path) {
-                            let slot = w.len() + 1;
-                            w.push(path.clone());
-                            let role = if slot == 1 { "REAL cursor    (mouse 0)" }
-                            else         { "ARTIFICIAL cursor (mouse 1)" };
-                            println!(
-                                "  [{slot}] {} → {role}",
-                                path.display()
-                            );
-                            if w.len() >= 2 {
-                                let _ = wake_tx.send(());
-                                return;
-                            }
-                        }
-                    }
-                }
-            })
-            .expect("calib thread spawn");
-
-        handles.push(handle);
-    }
-    drop(wake_tx); // so the channel closes if all threads finish early
-
-    // Wait until 2 devices are seen OR timeout expires.
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() { break; }
-        // Wake either when a 2nd device reports in, or after a short poll.
-        let _ = wake_rx.recv_timeout(remaining.min(Duration::from_millis(200)));
-
-        let w = winners.lock().unwrap();
-        if w.len() >= 2 { break; }
-    }
-
-    // Signal all threads to stop (they check winners.len() >= 2 at the top).
-    // We don't join them — they are short-lived and will exit on their own once
-    // their grabbed device is released by the main program opening it again.
-    // (Alternatively they exit as soon as the winner list hits 2.)
-
-    let w = winners.lock().unwrap();
-    if w.len() >= 2 {
-        println!();
-        Some([w[0].clone(), w[1].clone()])
-    } else {
-        eprintln!(
-            "\nCalibration timed out: only {}/{} mice produced input.",
-            w.len(), 2
-        );
-        None
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -479,19 +369,22 @@ fn make_shm_buffer(
 // ─────────────────────────────────────────────────────────────────────────────
 
 enum Msg {
-    /// Mouse movement delta from one physical device
-    Move { idx: usize, dx: f64, dy: f64, swapped: bool },
-    /// Mouse button press / release from one physical device
+    /// Mouse/trackpad movement delta from one physical device
+    Move { idx: usize, dx: f64, dy: f64 },
+    /// Mouse/trackpad button press / release from one physical device
     /// `code`  — raw Linux key code (BTN_LEFT = 0x110, etc.)
     /// `value` — 0 = release, 1 = press, 2 = autorepeat
-    Button { idx: usize, code: u16, value: i32, swapped: bool },
+    Button { idx: usize, code: u16, value: i32 },
     /// Scroll wheel tick(s) — dv = vertical delta, dh = horizontal delta
-    Scroll { idx: usize, dv: i32, dh: i32, swapped: bool },
+    Scroll { idx: usize, dv: i32, dh: i32 },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Per-cursor state (only one artificial cursor now)
 // ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq)]
+enum CursorColor { White, Black }
 
 struct Cursor {
     surface:       wl_surface::WlSurface,
@@ -500,9 +393,14 @@ struct Cursor {
     buffer:        wl_buffer::WlBuffer,
     x: i32,
     y: i32,
-    /// Display size (half of the PNG's natural size)
-    display_size: i32,
+    display_w: i32,
+    display_h: i32,
     configured: bool,
+    /// Real-cursor position saved before this cursor's click-teleport.
+    /// `None` means this cursor is not currently teleported.
+    saved_real_pos: Option<(i32, i32)>,
+    /// How many of this cursor's buttons are currently held down.
+    buttons_held: u32,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -522,65 +420,68 @@ struct AppState {
     /// Fullscreen bottom-layer surface used solely to receive pointer-enter
     /// events so we can call set_cursor(NULL) and hide the real cursor.
     pointer_surface: Option<wl_surface::WlSurface>,
-    /// The single artificial cursor (driven by mouse 1).
+    /// Artificial cursors, created on demand (one per non-primary device).
     cursors:       Vec<Cursor>,
     screen_w:      i32,
     screen_h:      i32,
     output_scale:  i32,
     rx:            std::sync::mpsc::Receiver<Msg>,
-    /// Natural PNG size (before halving for display)
-    cursor_size:   u32,
-    cursor_pixels: Vec<u8>,
-    /// ABS virtual device — used for click-teleport injection at the
+    /// Pre-scaled ARGB8888 pixels + (width, height) for each cursor color.
+    white_pixels:  Vec<u8>,
+    white_size:    (u32, u32),
+    black_pixels:  Vec<u8>,
+    black_size:    (u32, u32),
+    /// ABS virtual device — used for click-teleport injection at an
     /// artificial cursor's position.
     abs_vdev:      Option<VirtualDevice>,
-    /// REL virtual device — passes mouse-0 movement to the compositor so
-    /// the real cursor behaves normally.
+    /// REL virtual device — passes the primary device's movement to the
+    /// compositor so the real cursor behaves normally.
     rel_vdev:      Option<VirtualDevice>,
-    /// Saved real-cursor position before a click-teleport (screen coords).
-    /// None means we are not currently teleported.
-    saved_real_pos: Option<(i32, i32)>,
-    /// How many mouse-1 buttons are currently held down.
-    mouse1_buttons_held: u32,
-    /// Last known real cursor position (updated from mouse-0 REL movements).
+    /// Maps a physical device index (order spawned) to its assigned role:
+    /// role 0 = real cursor (pass-through); role N>=1 = cursors[N-1].
+    /// Assigned lazily the first time each device produces input.
+    device_roles:  std::collections::HashMap<usize, usize>,
+    /// Last known real cursor position (updated from role-0 movements).
     real_cursor_x: i32,
     real_cursor_y: i32,
 }
 
 impl AppState {
-    fn try_create_cursors(&mut self, qh: &QueueHandle<Self>) {
-        if !self.cursors.is_empty() { return; }
-        if self.screen_w == 0 || self.screen_h == 0 { return; }
-        let (comp, shm, shell, output) = match (
-            self.compositor.as_ref(), self.shm.as_ref(),
-            self.layer_shell.as_ref(), self.output.as_ref(),
-        ) {
-            (Some(c), Some(s), Some(sh), Some(o)) => (c, s, sh, o),
-            _ => return,
+    /// Create a new artificial cursor surface of the given color.
+    /// Assumes Wayland globals + screen size are already known (true by the
+    /// time the main loop is running).  Returns the new cursor's index.
+    fn try_create_cursor(&mut self, qh: &QueueHandle<Self>, color: CursorColor) -> usize {
+        let comp   = self.compositor.clone().expect("compositor not bound");
+        let shm    = self.shm.clone().expect("shm not bound");
+        let shell  = self.layer_shell.clone().expect("layer_shell not bound");
+        let output = self.output.clone().expect("output not bound");
+
+        let (png_w, png_h, pixels) = match color {
+            CursorColor::White => (self.white_size.0, self.white_size.1, self.white_pixels.clone()),
+            CursorColor::Black => (self.black_size.0, self.black_size.1, self.black_pixels.clone()),
         };
 
-        let png_size     = self.cursor_size;
-        let display_size = png_size;
-        let start_x      = self.screen_w * 3 / 4;
-        let start_y      = self.screen_h / 2;
+        let start_x = self.screen_w * 3 / 4;
+        let start_y = self.screen_h / 2;
 
         let surface = comp.create_surface(qh, ());
         let layer_surface = shell.get_layer_surface(
-            &surface, Some(output), Layer::Overlay,
-            "dual-cursor-1".to_string(), qh, (),
+            &surface, Some(&output), Layer::Overlay,
+            format!("dual-cursor-{}", self.cursors.len() + 1), qh, (),
         );
         layer_surface.set_anchor(Anchor::Top | Anchor::Left);
         // Surface size equals the (already scaled) pixel buffer size
-        layer_surface.set_size(display_size, display_size);
+        layer_surface.set_size(png_w, png_h);
         layer_surface.set_keyboard_interactivity(
             zwlr_layer_surface_v1::KeyboardInteractivity::None,
         );
         layer_surface.set_exclusive_zone(-1);
 
-        let (pool, buf) = make_shm_buffer(shm, qh, png_size, png_size, &self.cursor_pixels);
+        let (pool, buf) = make_shm_buffer(&shm, qh, png_w, png_h, &pixels);
 
         surface.commit();
 
+        let idx = self.cursors.len();
         self.cursors.push(Cursor {
             surface,
             layer_surface,
@@ -588,14 +489,18 @@ impl AppState {
             buffer: buf,
             x: start_x,
             y: start_y,
-            display_size: display_size as i32,
+            display_w: png_w as i32,
+            display_h: png_h as i32,
             configured: false,
+            saved_real_pos: None,
+            buttons_held: 0,
         });
+        idx
     }
 
-    fn move_cursor(&mut self, idx: usize, dx: f64, dy: f64) {
-        if idx == 0 {
-            // Mouse 0: pass movement through to the REL virtual device so the
+    fn move_cursor(&mut self, role: usize, dx: f64, dy: f64) {
+        if role == 0 {
+            // Role 0: pass movement through to the REL virtual device so the
             // real compositor cursor moves.
             self.real_cursor_x = (self.real_cursor_x + dx as i32)
                 .clamp(0, self.screen_w - 1);
@@ -615,19 +520,21 @@ impl AppState {
             return;
         }
 
-        // Mouse 1: move the artificial cursor surface
-        if self.cursors.is_empty() { return; }
-        let c = &mut self.cursors[0];
+        // Role >= 1: move the corresponding artificial cursor surface
+        let i = role - 1;
+        if i >= self.cursors.len() { return; }
+        let c = &mut self.cursors[i];
         if !c.configured { return; }
         c.x = (c.x + dx as i32).clamp(0, self.screen_w - 1);
         c.y = (c.y + dy as i32).clamp(0, self.screen_h - 1);
         let (cx, cy) = (c.x, c.y);
+        let teleported = c.saved_real_pos.is_some();
         c.layer_surface.set_margin(cy, 0, 0, cx);
         c.surface.commit();
 
         // While a button is held (drag in progress), keep the real cursor
         // tracking the artificial one so the drag target sees movement.
-        if self.saved_real_pos.is_some() {
+        if teleported {
             if let Some(vdev) = &mut self.abs_vdev {
                 let events = [
                     InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, cx),
@@ -641,42 +548,35 @@ impl AppState {
 
     fn commit_cursor(&mut self, idx: usize) {
         if idx >= self.cursors.len() { return; }
-        let c            = &mut self.cursors[idx];
-        let display_size = c.display_size;
+        let c = &mut self.cursors[idx];
+        let (w, h) = (c.display_w, c.display_h);
         c.layer_surface.set_margin(c.y, 0, 0, c.x);
         c.surface.attach(Some(&c.buffer), 0, 0);
-        c.surface.damage(0, 0, display_size, display_size);
+        c.surface.damage(0, 0, w, h);
         c.surface.commit();
     }
 
-    /// Swap BTN_LEFT ↔ BTN_RIGHT for mouse 1 (left-handed swap).
-    fn remap_button_code(idx: usize, code: u16) -> u16 {
-        if idx == 1 {
-            if code == BTN_LEFT  { return BTN_RIGHT; }
-            if code == BTN_RIGHT { return BTN_LEFT;  }
-        }
-        code
-    }
-
-    /// Handle button events from either mouse.
+    /// Handle button events from any device.
     ///
-    /// Mouse 0: inject directly via the REL virtual device (normal click).
-    /// Mouse 1: swap L/R, then:
+    /// Role 0: inject directly via the REL virtual device (normal click).
+    /// Role >= 1 (artificial cursor):
     ///   - on first press  → teleport real cursor to artificial position, inject press
     ///   - on release of all buttons → inject release, restore real cursor
-    ///   If mouse 0 presses a button while teleported → restore real cursor first.
-    fn handle_button(&mut self, idx: usize, code: u16, value: i32) {
-        let mapped_code = Self::remap_button_code(idx, code);
-
-        if idx == 0 {
-            // Mouse 0 pressed while we are teleported → restore immediately,
-            // then emit the click at the restored position.
-            if value == 1 && self.saved_real_pos.is_some() {
-                self.restore_real_cursor();
+    ///   If role 0 presses a button while some cursor is teleported → restore it first.
+    fn handle_button(&mut self, role: usize, code: u16, value: i32) {
+        if role == 0 {
+            // Role 0 pressed while some artificial cursor is teleported →
+            // restore it immediately, then emit the click at the restored position.
+            if value == 1 {
+                for i in 0..self.cursors.len() {
+                    if self.cursors[i].saved_real_pos.is_some() {
+                        self.restore_real_cursor(i);
+                    }
+                }
             }
             if let Some(vdev) = &mut self.rel_vdev {
                 let events = [
-                    InputEvent::new(EventType::KEY.0, mapped_code, value),
+                    InputEvent::new(EventType::KEY.0, code, value),
                     InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
                 ];
                 if let Err(e) = vdev.emit(&events) {
@@ -686,16 +586,17 @@ impl AppState {
             return;
         }
 
-        // Mouse 1 ──────────────────────────────────────────────────────────
-        if self.cursors.is_empty() { return; }
-        let (cx, cy) = (self.cursors[0].x, self.cursors[0].y);
+        // Artificial cursor ──────────────────────────────────────────────
+        let i = role - 1;
+        if i >= self.cursors.len() { return; }
+        let (cx, cy) = (self.cursors[i].x, self.cursors[i].y);
 
         if value == 1 {
             // Press: teleport (or we're already teleported from a previous press)
-            self.mouse1_buttons_held += 1;
-            if self.saved_real_pos.is_none() {
+            self.cursors[i].buttons_held += 1;
+            if self.cursors[i].saved_real_pos.is_none() {
                 // Save real cursor position and teleport
-                self.saved_real_pos = Some((self.real_cursor_x, self.real_cursor_y));
+                self.cursors[i].saved_real_pos = Some((self.real_cursor_x, self.real_cursor_y));
                 if let Some(vdev) = &mut self.abs_vdev {
                     let events = [
                         InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, cx),
@@ -708,7 +609,7 @@ impl AppState {
             // Inject button press at the teleported position
             if let Some(vdev) = &mut self.abs_vdev {
                 let events = [
-                    InputEvent::new(EventType::KEY.0, mapped_code, 1),
+                    InputEvent::new(EventType::KEY.0, code, 1),
                     InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
                 ];
                 if let Err(e) = vdev.emit(&events) {
@@ -717,28 +618,28 @@ impl AppState {
             }
         } else if value == 0 {
             // Release
-            if self.mouse1_buttons_held > 0 {
-                self.mouse1_buttons_held -= 1;
+            if self.cursors[i].buttons_held > 0 {
+                self.cursors[i].buttons_held -= 1;
             }
             // Inject release first, then restore if all buttons are up
             if let Some(vdev) = &mut self.abs_vdev {
                 let events = [
-                    InputEvent::new(EventType::KEY.0, mapped_code, 0),
+                    InputEvent::new(EventType::KEY.0, code, 0),
                     InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0),
                 ];
                 if let Err(e) = vdev.emit(&events) {
                     eprintln!("[uinput-abs] release emit error: {e}");
                 }
             }
-            if self.mouse1_buttons_held == 0 {
-                self.restore_real_cursor();
+            if self.cursors[i].buttons_held == 0 {
+                self.restore_real_cursor(i);
             }
         }
     }
 
-    /// Move the real cursor back to where it was before the teleport.
-    fn restore_real_cursor(&mut self) {
-        if let Some((rx, ry)) = self.saved_real_pos.take() {
+    /// Move the real cursor back to where it was before cursor `i`'s teleport.
+    fn restore_real_cursor(&mut self, i: usize) {
+        if let Some((rx, ry)) = self.cursors[i].saved_real_pos.take() {
             if let Some(vdev) = &mut self.abs_vdev {
                 let events = [
                     InputEvent::new(EventType::ABSOLUTE.0, AbsoluteAxisCode::ABS_X.0, rx),
@@ -748,15 +649,16 @@ impl AppState {
                 let _ = vdev.emit(&events);
             }
         }
-        self.mouse1_buttons_held = 0;
+        self.cursors[i].buttons_held = 0;
     }
 
     /// Forward scroll wheel events.
-    /// Both mice scroll goes to the REL vdevice (the real cursor's scroll
-    /// context). Mouse 1 also forwards to the ABS vdevice when teleported so
-    /// the target window receives scroll events during a click-hold.
-    fn handle_scroll(&mut self, idx: usize, dv: i32, dh: i32) {
-        // Always emit on the REL device (mouse 0's real-cursor context).
+    /// All devices' scroll goes to the REL vdevice (the real cursor's scroll
+    /// context). An artificial cursor's scroll also forwards to the ABS
+    /// vdevice when teleported so the target window receives scroll events
+    /// during a click-hold.
+    fn handle_scroll(&mut self, role: usize, dv: i32, dh: i32) {
+        // Always emit on the REL device (role-0's real-cursor context).
         if let Some(vdev) = &mut self.rel_vdev {
             let mut events: Vec<InputEvent> = Vec::new();
             if dv != 0 {
@@ -770,20 +672,23 @@ impl AppState {
                 eprintln!("[uinput-rel] scroll emit error: {e}");
             }
         }
-        // If mouse 1 scrolls while teleported, also send on the ABS device so
-        // the window under the artificial cursor receives the scroll.
-        if idx == 1 && self.saved_real_pos.is_some() {
-            if let Some(vdev) = &mut self.abs_vdev {
-                let mut events: Vec<InputEvent> = Vec::new();
-                if dv != 0 {
-                    events.push(InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_WHEEL.0, dv));
-                }
-                if dh != 0 {
-                    events.push(InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_HWHEEL.0, dh));
-                }
-                events.push(InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0));
-                if let Err(e) = vdev.emit(&events) {
-                    eprintln!("[uinput-abs] scroll emit error: {e}");
+        // If an artificial cursor scrolls while teleported, also send on the
+        // ABS device so the window under that cursor receives the scroll.
+        if role >= 1 {
+            let i = role - 1;
+            if i < self.cursors.len() && self.cursors[i].saved_real_pos.is_some() {
+                if let Some(vdev) = &mut self.abs_vdev {
+                    let mut events: Vec<InputEvent> = Vec::new();
+                    if dv != 0 {
+                        events.push(InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_WHEEL.0, dv));
+                    }
+                    if dh != 0 {
+                        events.push(InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_HWHEEL.0, dh));
+                    }
+                    events.push(InputEvent::new(EventType::SYNCHRONIZATION.0, 0, 0));
+                    if let Err(e) = vdev.emit(&events) {
+                        eprintln!("[uinput-abs] scroll emit error: {e}");
+                    }
                 }
             }
         }
@@ -866,7 +771,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
                 }
                 _ => {}
             }
-            state.try_create_cursors(qh);
             state.try_hide_cursor(qh);
         }
     }
@@ -902,7 +806,7 @@ delegate_noop!(AppState: ignore zwlr_layer_shell_v1::ZwlrLayerShellV1);
 impl Dispatch<wl_output::WlOutput, ()> for AppState {
     fn event(
         state: &mut Self, _: &wl_output::WlOutput,
-        event: wl_output::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>,
+        event: wl_output::Event, _: &(), _: &Connection, _qh: &QueueHandle<Self>,
     ) {
         match event {
             wl_output::Event::Scale { factor } => {
@@ -918,7 +822,6 @@ impl Dispatch<wl_output::WlOutput, ()> for AppState {
                         state.screen_h = logical_h;
                         println!("[output] Mode fallback (no xdg_output): {logical_w}×{logical_h}px");
                         state.abs_vdev = create_virtual_abs_mouse("dual-cursor-abs", logical_w, logical_h);
-                        state.try_create_cursors(qh);
                     }
                 }
             _ => {}
@@ -934,14 +837,13 @@ impl Dispatch<zxdg_output_manager_v1::ZxdgOutputManagerV1, ()> for AppState {
 impl Dispatch<zxdg_output_v1::ZxdgOutputV1, ()> for AppState {
     fn event(
         state: &mut Self, _: &zxdg_output_v1::ZxdgOutputV1,
-        event: zxdg_output_v1::Event, _: &(), _: &Connection, qh: &QueueHandle<Self>,
+        event: zxdg_output_v1::Event, _: &(), _: &Connection, _qh: &QueueHandle<Self>,
     ) {
         if let zxdg_output_v1::Event::LogicalSize { width, height } = event {
             state.screen_w = width;
             state.screen_h = height;
             println!("[output] Logical size (xdg_output): {width}×{height}px");
             state.abs_vdev = create_virtual_abs_mouse("dual-cursor-abs", width, height);
-            state.try_create_cursors(qh);
         }
     }
 }
@@ -977,82 +879,94 @@ impl Dispatch<wl_pointer::WlPointer, ()> for AppState {
 // Main
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn main() {
-    // 0. Load cursor image (compile-time embedded from assets/)
-    let (w0, h0, px0_full) = load_png_as_argb8888(CURSOR_WHITE_PNG);
-    let (sw, sh, px0) = scale_argb8888(&px0_full, w0, h0, CURSOR_DISPLAY_SCALE);
-    let cursor_size = sw;
-    println!("Cursor image size: {w0}×{h0}px (displayed at {sw}×{sh}px)");
-
-    // 1. Parse command-line arguments for --swap flag
-    let mut cli: Vec<String> = env::args().skip(1).collect();
-    let swap_mode = cli.iter().any(|arg| arg == "--swap");
-    cli.retain(|arg| arg != "--swap");
-
-    // 2. Resolve device paths
-    let devices: Vec<PathBuf> = if cli.len() >= 2 {
-        // Explicit paths supplied on the command line — use as-is (mouse 0 = real,
-        // mouse 1 = artificial), skipping calibration.
-        cli.iter().take(2).map(PathBuf::from).collect()
+/// Assign (and lazily create) the role for a device the first time it
+/// produces input. Role 0 = real cursor (pass-through, no surface needed).
+/// Role N>=1 = an artificial cursor (cursors[N-1]), alternating white/black
+/// starting with white for role 1.
+fn role_for(state: &mut AppState, qh: &QueueHandle<AppState>, dev_idx: usize) -> usize {
+    if let Some(&r) = state.device_roles.get(&dev_idx) {
+        return r;
+    }
+    let role = state.device_roles.len();
+    if role == 0 {
+        println!("[role] device {dev_idx} → REAL cursor (pass-through)");
     } else {
-        // Auto-discover all mice, then let the user choose roles by moving them.
-        let candidates = discover_mice(32); // find up to 32 mice
-        if candidates.len() < 2 {
+        let color = if (role - 1) % 2 == 0 { CursorColor::White } else { CursorColor::Black };
+        let name  = if color == CursorColor::White { "white" } else { "black" };
+        let cidx  = state.try_create_cursor(qh, color);
+        println!("[role] device {dev_idx} → artificial {name} cursor (#{cidx})");
+    }
+    state.device_roles.insert(dev_idx, role);
+    role
+}
+
+fn main() {
+    // 0. Load cursor images (compile-time embedded from assets/)
+    let (ww, wh, white_full) = load_png_as_argb8888(CURSOR_WHITE_PNG);
+    let (white_w, white_h, white_pixels) = scale_argb8888(&white_full, ww, wh, CURSOR_DISPLAY_SCALE);
+    let (bw, bh, black_full) = load_png_as_argb8888(CURSOR_BLACK_PNG);
+    let (black_w, black_h, black_pixels) = scale_argb8888(&black_full, bw, bh, CURSOR_DISPLAY_SCALE);
+    println!("White cursor: {ww}×{wh}px (displayed at {white_w}×{white_h}px)");
+    println!("Black cursor: {bw}×{bh}px (displayed at {black_w}×{black_h}px)");
+
+    // 1. Resolve device paths — explicit args, or auto-discover all mice/trackpads.
+    let args: Vec<String> = env::args().skip(1).collect();
+    let devices: Vec<PathBuf> = if !args.is_empty() {
+        args.iter().map(PathBuf::from).collect()
+    } else {
+        let found = discover_pointers(32);
+        if found.is_empty() {
             eprintln!(
-                "Need at least 2 mouse devices; found {}.\n\
+                "No mouse/trackpad devices found.\n\
                  Add yourself to the input group (sudo usermod -aG input $USER, then re-login)\n\
-                 or specify devices explicitly: double_cursor /dev/input/eventX /dev/input/eventY",
-                candidates.len()
+                 or specify devices explicitly: double_cursor /dev/input/eventX /dev/input/eventY ..."
             );
             std::process::exit(1);
         }
-
-        match calibrate_mice(&candidates, Duration::from_secs(30)) {
-            Some([p0, p1]) => vec![p0, p1],
-            None => {
-                eprintln!(
-                    "Calibration failed.  You can skip it by specifying devices explicitly:\n  \
-                     double_cursor /dev/input/eventX /dev/input/eventY"
-                );
-                std::process::exit(1);
-            }
-        }
+        found
     };
-    if swap_mode {
-        println!("Mouse 0 (artificial cursor) → {}", devices[0].display());
-        println!("Mouse 1 (real cursor)       → {}", devices[1].display());
-    } else {
-        println!("Mouse 0 (real cursor)       → {}", devices[0].display());
-        println!("Mouse 1 (artificial cursor) → {}", devices[1].display());
+    println!("Watching {} device(s):", devices.len());
+    for p in &devices {
+        println!("  {}", p.display());
     }
+    println!(
+        "The first device to send input becomes the REAL cursor.\n\
+         Each subsequent new device gets its own artificial cursor,\n\
+         alternating white, black, white, black, ..."
+    );
 
-    // 3. Event channel
+    // 2. Event channel
     let (tx, rx) = std::sync::mpsc::channel::<Msg>();
 
-    // 4. Spawn evdev reader threads — one per physical mouse
+    // 3. Spawn an evdev reader thread per device (mice and/or trackpads)
     for (idx, path) in devices.iter().enumerate() {
         let path = path.clone();
         let tx = tx.clone();
-        let swapped = swap_mode;
         thread::Builder::new()
-            .name(format!("mouse-{idx}"))
+            .name(format!("dev-{idx}"))
             .spawn(move || {
                 let mut dev = match Device::open(&path) {
                     Ok(d) => d,
-                    Err(e) => { eprintln!("[mouse-{idx}] open: {e}"); return; }
+                    Err(e) => { eprintln!("[dev-{idx}] open: {e}"); return; }
                 };
                 match dev.grab() {
                     Ok(_)  => {},
                     Err(e) => eprintln!(
-                        "[mouse-{idx}] grab failed ({e}) — system cursor will also move.\n\
+                        "[dev-{idx}] grab failed ({e}) — system cursor will also move.\n\
                          Fix: sudo usermod -aG input $USER, then re-login and run WITHOUT sudo."
                     ),
                 }
                 let (mut pdx, mut pdy) = (0.0f64, 0.0f64);
                 let (mut pdv, mut pdh) = (0i32, 0i32);
+                // Touchpad tracking: only accumulate ABS_X/ABS_Y deltas while
+                // a finger is down, and reset the baseline on touch-up so a
+                // re-touch at a different spot doesn't jump the cursor.
+                let mut touching = false;
+                let mut last_abs: Option<(i32, i32)> = None;
+                let mut cur_abs: (i32, i32) = (0, 0);
                 loop {
                     match dev.fetch_events() {
-                        Err(e) => { eprintln!("[mouse-{idx}] read error: {e}"); break; }
+                        Err(e) => { eprintln!("[dev-{idx}] read error: {e}"); break; }
                         Ok(evs) => for ev in evs {
                             match ev.destructure() {
                                 EventSummary::RelativeAxis(_, RelativeAxisCode::REL_X, v) =>
@@ -1063,22 +977,36 @@ fn main() {
                                     pdv += v,
                                 EventSummary::RelativeAxis(_, RelativeAxisCode::REL_HWHEEL, v) =>
                                     pdh += v,
+                                EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_X, v) =>
+                                    cur_abs.0 = v,
+                                EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_Y, v) =>
+                                    cur_abs.1 = v,
                                 EventSummary::Synchronization(..) => {
+                                    if touching {
+                                        if let Some((lx, ly)) = last_abs {
+                                            pdx += (cur_abs.0 - lx) as f64 * SPEED;
+                                            pdy += (cur_abs.1 - ly) as f64 * SPEED;
+                                        }
+                                        last_abs = Some(cur_abs);
+                                    }
                                     if pdx != 0.0 || pdy != 0.0 {
-                                        let _ = tx.send(Msg::Move { idx, dx: pdx, dy: pdy, swapped });
+                                        let _ = tx.send(Msg::Move { idx, dx: pdx, dy: pdy });
                                         pdx = 0.0;
                                         pdy = 0.0;
                                     }
                                     if pdv != 0 || pdh != 0 {
-                                        let _ = tx.send(Msg::Scroll { idx, dv: pdv, dh: pdh, swapped });
+                                        let _ = tx.send(Msg::Scroll { idx, dv: pdv, dh: pdh });
                                         pdv = 0;
                                         pdh = 0;
                                     }
                                 }
                                 EventSummary::Key(_, key, value) => {
                                     let code = key.code();
-                                    if code >= 0x110 {
-                                        let _ = tx.send(Msg::Button { idx, code, value, swapped });
+                                    if code == BTN_TOUCH || code == BTN_TOOL_FINGER {
+                                        touching = value != 0;
+                                        last_abs = None;
+                                    } else if (0x110..=0x117).contains(&code) {
+                                        let _ = tx.send(Msg::Button { idx, code, value });
                                     }
                                 }
                                 _ => {}
@@ -1091,11 +1019,11 @@ fn main() {
     }
     drop(tx);
 
-    // 5. Create REL virtual device for mouse-0 pass-through immediately
+    // 4. Create REL virtual device for the real cursor's pass-through
     //    (doesn't need screen dimensions).
     let rel_vdev = create_virtual_rel_mouse("dual-cursor-rel");
 
-    // 6. Connect to Wayland
+    // 5. Connect to Wayland
     let conn = connect_wayland();
     let mut event_queue = conn.new_event_queue::<AppState>();
     let qh = event_queue.handle();
@@ -1111,19 +1039,18 @@ fn main() {
         screen_h: 0,
         output_scale: 1,
         rx,
-        cursor_size,
-        cursor_pixels: px0,
+        white_pixels, white_size: (white_w, white_h),
+        black_pixels, black_size: (black_w, black_h),
         abs_vdev: None,
         rel_vdev,
-        saved_real_pos: None,
-        mouse1_buttons_held: 0,
+        device_roles: std::collections::HashMap::new(),
         real_cursor_x: 0,
         real_cursor_y: 0,
     };
 
-    // First roundtrip: bind globals, receive wl_output::Mode, create layer surfaces
+    // First roundtrip: bind globals, receive wl_output::Mode
     event_queue.roundtrip(&mut state).expect("initial roundtrip");
-    // Second roundtrip: receive Configure events
+    // Second roundtrip: receive any further configuration events
     event_queue.roundtrip(&mut state).expect("configure roundtrip");
 
     if state.screen_w == 0 || state.screen_h == 0 {
@@ -1152,46 +1079,31 @@ fn main() {
         std::process::exit(1);
     }
 
-    if state.cursors.iter().filter(|c| c.configured).count() < 1 {
-        eprintln!("WARNING: artificial cursor has not received a Configure event yet — it may appear after first mouse-1 movement.");
-    }
+    println!("Running.  Ctrl-C to quit.");
 
-    println!("Running.");
-    if swap_mode {
-        println!("  --swap mode active:");
-        println!("  Mouse 0 → artificial white cursor (half-size, left/right buttons swapped).");
-        println!("  Mouse 1 → real cursor (normal behaviour).");
-        println!("  Mouse 0 click → teleports real cursor there, clicks, then returns it.");
-    } else {
-        println!("  Mouse 0 → real cursor (normal behaviour).");
-        println!("  Mouse 1 → artificial white cursor (half-size, left/right buttons swapped).");
-        println!("  Mouse 1 click → teleports real cursor there, clicks, then returns it.");
-    }
-    println!("  Ctrl-C to quit.");
-
-    // 7. Main event loop
+    // 6. Main event loop
     while state.running {
         event_queue.flush().ok();
 
         loop {
             match state.rx.try_recv() {
                 Ok(msg) => match msg {
-                    Msg::Move { idx, dx, dy, swapped } => {
-                        let effective_idx = if swapped { 1 - idx } else { idx };
-                        state.move_cursor(effective_idx, dx, dy);
+                    Msg::Move { idx, dx, dy } => {
+                        let role = role_for(&mut state, &qh, idx);
+                        state.move_cursor(role, dx, dy);
                     },
-                    Msg::Button { idx, code, value, swapped } => {
-                        let effective_idx = if swapped { 1 - idx } else { idx };
-                        state.handle_button(effective_idx, code, value);
+                    Msg::Button { idx, code, value } => {
+                        let role = role_for(&mut state, &qh, idx);
+                        state.handle_button(role, code, value);
                     },
-                    Msg::Scroll { idx, dv, dh, swapped } => {
-                        let effective_idx = if swapped { 1 - idx } else { idx };
-                        state.handle_scroll(effective_idx, dv, dh);
+                    Msg::Scroll { idx, dv, dh } => {
+                        let role = role_for(&mut state, &qh, idx);
+                        state.handle_scroll(role, dv, dh);
                     },
                 },
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    eprintln!("All mouse threads exited.");
+                    eprintln!("All device threads exited.");
                     state.running = false;
                     break;
                 }
